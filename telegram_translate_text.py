@@ -104,7 +104,6 @@ def has_vietnamese_chars(text: str) -> bool:
 
 
 def strip_for_detect(text: str) -> str:
-    # Giữ chữ cái, số, khoảng trắng, CJK để detect ổn hơn
     text = re.sub(r"https?://\S+", " ", text)
     text = re.sub(r"[^\w\s\u4e00-\u9fffÀ-ỹ]", " ", text, flags=re.UNICODE)
     text = normalize_spaces(text)
@@ -126,9 +125,8 @@ def detect_input_language(text: str) -> str:
         return "vi"
 
     cleaned = strip_for_detect(raw)
-
-    # Các câu quá ngắn rất dễ detect sai -> mặc định en
     letters_only = re.sub(r"[^A-Za-zÀ-ỹ\u4e00-\u9fff]", "", cleaned)
+
     if len(letters_only) <= 2:
         return "en"
 
@@ -147,9 +145,6 @@ def detect_input_language(text: str) -> str:
 
 
 def is_noise_message(text: str) -> bool:
-    """
-    Bỏ qua link, command, emoji rời rạc, hoặc text quá ít thông tin.
-    """
     text = (text or "").strip()
     if not text:
         return True
@@ -160,7 +155,6 @@ def is_noise_message(text: str) -> bool:
     if text.startswith("http://") or text.startswith("https://"):
         return True
 
-    # Chỉ emoji / ký hiệu / số
     has_letters = bool(re.search(r"[A-Za-zÀ-ỹ\u4e00-\u9fff]", text))
     if not has_letters:
         return True
@@ -169,22 +163,148 @@ def is_noise_message(text: str) -> bool:
 
 
 # =========================
-# IPA & Pinyin
+# IPA helpers
+# 1 dòng duy nhất: stress + connected speech
 # =========================
+EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+IPA_VOWELS = set("iyɪeɛæɑɒɔoʊuʊʌəɚɝɜa")
+
+WEAK_FORMS = {
+    "a": "ə",
+    "an": "ən",
+    "am": "əm",
+    "and": "ən",
+    "are": "ɚ",
+    "as": "əz",
+    "at": "ət",
+    "can": "kən",
+    "for": "fɚ",
+    "from": "frəm",
+    "of": "əv",
+    "or": "ɚ",
+    "some": "səm",
+    "than": "ðən",
+    "that": "ðət",
+    "them": "ðəm",
+    "to": "tə",
+    "us": "əs",
+    "was": "wəz",
+    "you": "jə",
+    "your": "jɚ",
+}
+
+
+def clean_ipa_text(text: str) -> str:
+    text = (text or "").replace("*", "").strip()
+    text = normalize_spaces(text)
+    return text
+
+
+def ipa_for_word(word: str) -> str | None:
+    if not word:
+        return None
+    try:
+        out = ipa.convert(word, keep_punct=False, stress_marks="both")
+        out = clean_ipa_text(out)
+        return out or None
+    except Exception as e:
+        print("Lỗi IPA word:", e)
+        return None
+
+
+def starts_with_vowel_sound(pron: str) -> bool:
+    if not pron:
+        return False
+    for ch in pron:
+        if ch in {"ˈ", "ˌ", " "}:
+            continue
+        return ch in IPA_VOWELS
+    return False
+
+
+def ends_with_t_or_d(pron: str) -> bool:
+    if not pron:
+        return False
+    pron = pron.rstrip()
+    return pron.endswith("t") or pron.endswith("d")
+
+
+def apply_flap(pron: str, next_pron: str | None) -> str:
+    """
+    Kiểu Mỹ: t/d trước nguyên âm tiếp theo -> ɾ
+    Ví dụ: get it -> gɛɾ ɪt
+    """
+    if not pron or not next_pron:
+        return pron
+
+    if starts_with_vowel_sound(next_pron) and ends_with_t_or_d(pron):
+        return pron[:-1] + "ɾ"
+
+    return pron
+
+
+def weak_form(word: str, next_pron: str | None) -> str | None:
+    w = (word or "").lower()
+
+    if w == "the":
+        return "ði" if next_pron and starts_with_vowel_sound(next_pron) else "ðə"
+
+    return WEAK_FORMS.get(w)
+
+
+def should_link(next_pron: str | None) -> bool:
+    return bool(next_pron and starts_with_vowel_sound(next_pron))
+
+
 def text_to_ipa(text: str) -> str | None:
+    """
+    1 dòng IPA duy nhất:
+    - có stress marks
+    - có weak forms
+    - có flap t/d -> ɾ
+    - có ký hiệu nối âm ‿
+    """
     if not text:
         return None
 
-    try:
-        ipa_text = ipa.convert(text, keep_punct=True, stress_marks="both")
-        ipa_text = ipa_text.replace("*", "")
-        ipa_text = normalize_spaces(ipa_text)
-        return ipa_text or None
-    except Exception as e:
-        print("Lỗi chuyển IPA:", e)
+    words = EN_WORD_RE.findall(text)
+    if not words:
         return None
 
+    base_prons = []
+    for word in words:
+        pron = ipa_for_word(word)
+        if not pron:
+            pron = word.lower()
+        base_prons.append(pron)
 
+    final_prons = []
+    for i, word in enumerate(words):
+        curr = base_prons[i]
+        next_pron = base_prons[i + 1] if i + 1 < len(base_prons) else None
+
+        reduced = weak_form(word, next_pron)
+        if reduced:
+            curr = reduced
+
+        curr = apply_flap(curr, next_pron)
+        final_prons.append(curr)
+
+    parts = []
+    for i, curr in enumerate(final_prons):
+        parts.append(curr)
+        if i < len(final_prons) - 1:
+            next_pron = final_prons[i + 1]
+            parts.append("‿" if should_link(next_pron) else " ")
+
+    out = "".join(parts)
+    out = clean_ipa_text(out)
+    return out or None
+
+
+# =========================
+# Pinyin
+# =========================
 def text_to_pinyin(text: str) -> str | None:
     """
     Chuyển chữ Hán sang pinyin có dấu.
