@@ -1,5 +1,7 @@
 import os
 import re
+from typing import Optional, List, Dict, Tuple
+
 from flask import Flask, request
 import telebot
 from telebot import types
@@ -21,7 +23,7 @@ WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else
 MAX_TRANSLATE_CHUNK = 1000
 MAX_TELEGRAM_LEN = 3500
 
-# Regex nhận diện
+# Regex nhận diện ngôn ngữ
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 VI_CHAR_RE = re.compile(
     r"[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]",
@@ -36,11 +38,10 @@ EN_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Cache translator để đỡ khởi tạo lại nhiều lần
-TRANSLATOR_CACHE = {}
+TRANSLATOR_CACHE: Dict[str, GoogleTranslator] = {}
 
 
-def get_translator(target: str):
+def get_translator(target: str) -> GoogleTranslator:
     if target not in TRANSLATOR_CACHE:
         TRANSLATOR_CACHE[target] = GoogleTranslator(source="auto", target=target)
     return TRANSLATOR_CACHE[target]
@@ -87,13 +88,13 @@ def detect_source_language(text: str) -> str:
     return "auto"
 
 
-def split_text_for_translate(text: str, max_len: int = MAX_TRANSLATE_CHUNK) -> list[str]:
+def split_text_for_translate(text: str, max_len: int = MAX_TRANSLATE_CHUNK) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
 
     lines = text.splitlines()
-    chunks = []
+    chunks: List[str] = []
     current = ""
 
     for line in lines:
@@ -116,12 +117,12 @@ def split_text_for_translate(text: str, max_len: int = MAX_TRANSLATE_CHUNK) -> l
     return chunks
 
 
-def translate_in_chunks(text: str, target: str) -> str | None:
+def translate_in_chunks(text: str, target: str) -> Optional[str]:
     chunks = split_text_for_translate(text)
     if not chunks:
         return None
 
-    translated_parts = []
+    translated_parts: List[str] = []
     translator = get_translator(target)
 
     for chunk in chunks:
@@ -133,55 +134,66 @@ def translate_in_chunks(text: str, target: str) -> str | None:
     return result or None
 
 
-def chinese_with_pinyin(text: str) -> tuple[str | None, str | None]:
+def chinese_with_pinyin(text: str) -> Tuple[Optional[str], Optional[str]]:
     if not text:
         return None, None
 
-    pinyin_parts = []
-    for line in text.splitlines():
-        if not line.strip():
-            pinyin_parts.append("")
-            continue
-        pinyin_parts.append(" ".join(lazy_pinyin(line, style=Style.TONE)))
+    hanzi = text.strip()
+    parts: List[str] = []
+    buffer: List[str] = []
 
-    return text, "\n".join(pinyin_parts).strip()
+    def flush_buffer():
+        nonlocal buffer
+        if buffer:
+            chinese_segment = "".join(buffer)
+            parts.append(" ".join(lazy_pinyin(chinese_segment, style=Style.TONE)))
+            buffer = []
+
+    for ch in hanzi:
+        if CJK_RE.match(ch):
+            buffer.append(ch)
+        else:
+            flush_buffer()
+            parts.append(ch)
+
+    flush_buffer()
+
+    pinyin = "".join(parts)
+    pinyin = re.sub(r"\s+", " ", pinyin).strip()
+    pinyin = re.sub(r"\s+([,.;:!?。，！？；：])", r"\1", pinyin)
+
+    return hanzi, pinyin
 
 
-def build_translations(text: str) -> dict:
+def build_translations(text: str) -> Dict[str, object]:
     source_lang = detect_source_language(text)
-    all_targets = [
-        ("vi", "🇻🇳 Tiếng Việt"),
-        ("en", "🇬🇧 English"),
-        ("zh-CN", "🇨🇳 中文"),
-    ]
-
-    # Nếu nhận diện chắc nguồn thì loại ngôn ngữ đó ra
-    if source_lang in {"vi", "en", "zh-CN"}:
-        targets = [item for item in all_targets if item[0] != source_lang]
-    else:
-        # Nếu chưa chắc thì dịch cả 3, cái nào giống nguyên văn sẽ tự loại
-        targets = all_targets
-
-    result = {"source_lang": source_lang, "items": []}
     original_norm = normalize_compare(text)
 
-    for target_code, label in targets:
+    if source_lang == "vi":
+        target_codes = ["en", "zh-CN"]
+    elif source_lang == "en":
+        target_codes = ["vi", "zh-CN"]
+    elif source_lang == "zh-CN":
+        target_codes = ["vi", "en"]
+    else:
+        target_codes = ["vi", "en", "zh-CN"]
+
+    items: List[Dict[str, str]] = []
+
+    for target_code in target_codes:
         try:
             translated = translate_in_chunks(text, target_code)
             if not translated:
                 continue
 
-            # Loại bản dịch bị trùng nguyên văn
             if normalize_compare(translated) == original_norm:
                 continue
 
-            entry = {
+            entry: Dict[str, str] = {
                 "target_code": target_code,
-                "label": label,
-                "text": translated,
+                "text": translated.strip(),
             }
 
-            # Nếu output là tiếng Trung thì thêm pinyin
             if target_code == "zh-CN":
                 hanzi, pinyin = chinese_with_pinyin(translated)
                 if hanzi:
@@ -189,39 +201,87 @@ def build_translations(text: str) -> dict:
                 if pinyin:
                     entry["pinyin"] = pinyin
 
-            result["items"].append(entry)
+            items.append(entry)
 
         except Exception as e:
             print(f"Lỗi dịch sang {target_code}:", e)
 
-    return result
+    return {
+        "source_lang": source_lang,
+        "items": items,
+    }
 
 
-def format_output(sender: str, source_lang: str, items: list[dict]) -> str | None:
+def format_output(items: List[Dict[str, str]]) -> Optional[str]:
     if not items:
         return None
 
-    source_label_map = {
-        "vi": "VI",
-        "en": "EN",
-        "zh-CN": "ZH",
-        "auto": "AUTO",
-    }
-    source_label = source_label_map.get(source_lang, "AUTO")
-
-    parts = [f"[{source_label}] {sender}"]
+    lines: List[str] = []
 
     for item in items:
-        parts.append(f"\n{item['label']}\n{item['text']}")
-        if item.get("pinyin"):
-            parts.append(f"🔤 Pinyin\n{item['pinyin']}")
+        target_code = item.get("target_code", "")
+        text = (item.get("text") or "").strip()
+        pinyin = (item.get("pinyin") or "").strip()
 
-    final_text = "\n".join(parts).strip()
+        if not text:
+            continue
 
-    if len(final_text) > MAX_TELEGRAM_LEN:
-        final_text = final_text[:MAX_TELEGRAM_LEN] + "\n\n...[message truncated]"
+        if target_code == "en":
+            lines.append(f"🇬🇧: {text}")
+        elif target_code == "vi":
+            lines.append(f"🇻🇳: {text}")
+        elif target_code == "zh-CN":
+            lines.append(f"🇨🇳: {text}")
+            if pinyin:
+                lines.append(f"🔤: {pinyin}")
 
-    return final_text
+    return "\n".join(lines).strip() or None
+
+
+def split_message_for_telegram(text: str, max_len: int = MAX_TELEGRAM_LEN) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= max_len:
+        return [text]
+
+    parts: List[str] = []
+    current = ""
+
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}".strip() if current else line
+
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+
+            if len(line) <= max_len:
+                current = line
+            else:
+                while len(line) > max_len:
+                    parts.append(line[:max_len])
+                    line = line[max_len:]
+                current = line
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+def send_long_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
+    chunks = split_message_for_telegram(text)
+
+    for i, chunk in enumerate(chunks):
+        bot.send_message(
+            chat_id,
+            chunk,
+            reply_to_message_id=reply_to_message_id if i == 0 else None,
+            disable_web_page_preview=True,
+        )
 
 
 @bot.message_handler(content_types=["text"])
@@ -241,20 +301,17 @@ def handle_message(message: types.Message):
         if text.startswith(("http://", "https://", "/")):
             return
 
-        sender = message.from_user.first_name or "User"
-
         payload = build_translations(text)
-        output = format_output(sender, payload["source_lang"], payload["items"])
+        output = format_output(payload["items"])  # type: ignore[index]
 
         if not output:
             print("Không dịch được:", repr(text[:200]))
             return
 
-        bot.send_message(
-            message.chat.id,
-            output,
+        send_long_message(
+            chat_id=message.chat.id,
+            text=output,
             reply_to_message_id=message.message_id,
-            disable_web_page_preview=True,
         )
 
     except Exception as e:
