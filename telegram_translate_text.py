@@ -4,8 +4,6 @@ from flask import Flask, request
 import telebot
 from telebot import types
 from deep_translator import GoogleTranslator
-
-# Thêm thư viện nhận diện ngôn ngữ + IPA + pinyin
 from langdetect import detect, DetectorFactory
 import eng_to_ipa as ipa
 from pypinyin import lazy_pinyin, Style
@@ -25,9 +23,17 @@ WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}" if RENDER_EXTERNAL_URL else None
 
 
-# -------------------------
-# Helpers
-# -------------------------
+# =========================
+# Text utils
+# =========================
+def normalize_spaces(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip()
+
+
 def split_text_for_translate(text: str, max_len: int = 1000) -> list[str]:
     text = (text or "").strip()
     if not text:
@@ -78,16 +84,13 @@ def safe_translate(text: str, target: str) -> str | None:
     try:
         return translate_in_chunks(text, target)
     except Exception as e:
-        print(f"Lỗi dịch sang {target}:", e)
+        print(f"Lỗi dịch sang {target}: {e}")
         return None
 
 
-def normalize_spaces(text: str) -> str:
-    text = re.sub(r"[ \t]+", " ", (text or "").strip())
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
-    return text.strip()
-
-
+# =========================
+# Language detection
+# =========================
 def contains_chinese(text: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", text))
 
@@ -95,21 +98,42 @@ def contains_chinese(text: str) -> bool:
 def has_vietnamese_chars(text: str) -> bool:
     return bool(re.search(
         r"[ăâđêôơưĂÂĐÊÔƠƯáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệ"
-        r"íìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]", text
+        r"íìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
+        text
     ))
+
+
+def strip_for_detect(text: str) -> str:
+    # Giữ chữ cái, số, khoảng trắng, CJK để detect ổn hơn
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^\w\s\u4e00-\u9fffÀ-ỹ]", " ", text, flags=re.UNICODE)
+    text = normalize_spaces(text)
+    return text
 
 
 def detect_input_language(text: str) -> str:
     """
-    Trả về: 'vi', 'en', hoặc 'zh'
+    Trả về: vi / en / zh
     """
-    text = (text or "").strip()
+    raw = (text or "").strip()
+    if not raw:
+        return "en"
 
-    if contains_chinese(text):
+    if contains_chinese(raw):
         return "zh"
 
+    if has_vietnamese_chars(raw):
+        return "vi"
+
+    cleaned = strip_for_detect(raw)
+
+    # Các câu quá ngắn rất dễ detect sai -> mặc định en
+    letters_only = re.sub(r"[^A-Za-zÀ-ỹ\u4e00-\u9fff]", "", cleaned)
+    if len(letters_only) <= 2:
+        return "en"
+
     try:
-        detected = detect(text)
+        detected = detect(cleaned)
         if detected == "vi":
             return "vi"
         if detected == "en":
@@ -119,31 +143,42 @@ def detect_input_language(text: str) -> str:
     except Exception as e:
         print("Lỗi detect language:", e)
 
-    if has_vietnamese_chars(text):
-        return "vi"
-
     return "en"
 
 
+def is_noise_message(text: str) -> bool:
+    """
+    Bỏ qua link, command, emoji rời rạc, hoặc text quá ít thông tin.
+    """
+    text = (text or "").strip()
+    if not text:
+        return True
+
+    if text.startswith("/"):
+        return True
+
+    if text.startswith("http://") or text.startswith("https://"):
+        return True
+
+    # Chỉ emoji / ký hiệu / số
+    has_letters = bool(re.search(r"[A-Za-zÀ-ỹ\u4e00-\u9fff]", text))
+    if not has_letters:
+        return True
+
+    return False
+
+
+# =========================
+# IPA & Pinyin
+# =========================
 def text_to_ipa(text: str) -> str | None:
     if not text:
         return None
 
     try:
-        ipa_text = ipa.convert(
-            text,
-            keep_punct=True,
-            stress_marks="both"
-        )
-        ipa_text = normalize_spaces(ipa_text)
-
-        if not ipa_text:
-            return None
-
-        # Bỏ dấu * nếu thư viện không nhận một số từ riêng / brand
+        ipa_text = ipa.convert(text, keep_punct=True, stress_marks="both")
         ipa_text = ipa_text.replace("*", "")
         ipa_text = normalize_spaces(ipa_text)
-
         return ipa_text or None
     except Exception as e:
         print("Lỗi chuyển IPA:", e)
@@ -153,15 +188,19 @@ def text_to_ipa(text: str) -> str | None:
 def text_to_pinyin(text: str) -> str | None:
     """
     Chuyển chữ Hán sang pinyin có dấu.
-    Giữ lại dấu câu cơ bản.
+    Giữ số, chữ Latin, dấu câu cơ bản.
     """
     if not text:
         return None
 
     try:
-        tokens = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9]+|\s+|[^\w\s]", text, flags=re.UNICODE)
-        out = []
+        tokens = re.findall(
+            r"[\u4e00-\u9fff]+|[A-Za-z0-9]+|\s+|[^\w\s]",
+            text,
+            flags=re.UNICODE
+        )
 
+        out = []
         for token in tokens:
             if re.fullmatch(r"[\u4e00-\u9fff]+", token):
                 py = " ".join(lazy_pinyin(token, style=Style.TONE, strict=False))
@@ -177,20 +216,17 @@ def text_to_pinyin(text: str) -> str | None:
         return None
 
 
-# -------------------------
-# Core logic
-# -------------------------
+# =========================
+# Core translate logic
+# =========================
 def translate_text(text: str):
     text = (text or "").strip()
     if not text:
         return None
 
-    if text.startswith("http://") or text.startswith("https://"):
-        return None
-
     source_lang = detect_input_language(text)
 
-    # Tiếng Việt -> EN + ZH
+    # VI -> EN + ZH
     if source_lang == "vi":
         translated_en = safe_translate(text, "en")
         translated_zh = safe_translate(text, "zh-CN")
@@ -201,32 +237,32 @@ def translate_text(text: str):
         return {
             "source_lang": "vi",
             "original": text,
+            "vi": text,
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
-            "vi": text,
             "zh": translated_zh,
             "pinyin": text_to_pinyin(translated_zh) if translated_zh else None,
         }
 
-    # Tiếng Trung -> VI + EN
+    # ZH -> EN + VI
     if source_lang == "zh":
-        translated_vi = safe_translate(text, "vi")
         translated_en = safe_translate(text, "en")
+        translated_vi = safe_translate(text, "vi")
 
-        if not translated_vi and not translated_en:
+        if not translated_en and not translated_vi:
             return None
 
         return {
             "source_lang": "zh",
             "original": text,
+            "zh": text,
+            "pinyin": text_to_pinyin(text),
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
             "vi": translated_vi,
-            "zh": text,
-            "pinyin": text_to_pinyin(text),
         }
 
-    # Mặc định là tiếng Anh -> VI + ZH
+    # EN -> VI + ZH
     translated_vi = safe_translate(text, "vi")
     translated_zh = safe_translate(text, "zh-CN")
 
@@ -244,70 +280,83 @@ def translate_text(text: str):
     }
 
 
+# =========================
+# Output formatting
+# =========================
 def format_reply(sender: str, data: dict) -> str:
     source_lang = data.get("source_lang")
     original = data.get("original")
+    vi = data.get("vi")
     en = data.get("en")
     ipa_text = data.get("ipa")
-    vi = data.get("vi")
     zh = data.get("zh")
     pinyin = data.get("pinyin")
 
-    parts = []
+    lines = []
 
     if source_lang == "vi":
-        parts.append(f"[VI → EN | ZH] {sender}")
-        parts.append(f"VI: {original}")
+        lines.append(f"🌐 {sender} | VI → EN + ZH")
+        lines.append("")
+        lines.append(f"🇻🇳 VI: {original}")
 
         if en:
-            parts.append(f"\nEN: {en}")
+            lines.append(f"🇺🇸 EN: {en}")
         if ipa_text:
-            parts.append(f"IPA: /{ipa_text}/")
+            lines.append(f"🔊 IPA: /{ipa_text}/")
 
         if zh:
-            parts.append(f"\nZH: {zh}")
+            lines.append(f"🇨🇳 ZH: {zh}")
         if pinyin:
-            parts.append(f"Pinyin: {pinyin}")
+            lines.append(f"🈶 Pinyin: {pinyin}")
 
-        return "\n".join(parts)
+        return "\n".join(lines)
 
     if source_lang == "zh":
-        parts.append(f"[ZH → EN | VI] {sender}")
-        parts.append(f"ZH: {original}")
+        lines.append(f"🌐 {sender} | ZH → EN + VI")
+        lines.append("")
+        lines.append(f"🇨🇳 ZH: {original}")
 
         if pinyin:
-            parts.append(f"Pinyin: {pinyin}")
+            lines.append(f"🈶 Pinyin: {pinyin}")
 
         if en:
-            parts.append(f"\nEN: {en}")
+            lines.append(f"🇺🇸 EN: {en}")
         if ipa_text:
-            parts.append(f"IPA: /{ipa_text}/")
+            lines.append(f"🔊 IPA: /{ipa_text}/")
 
         if vi:
-            parts.append(f"\nVI: {vi}")
+            lines.append(f"🇻🇳 VI: {vi}")
 
-        return "\n".join(parts)
+        return "\n".join(lines)
 
-    parts.append(f"[EN → VI | ZH] {sender}")
-    parts.append(f"EN: {original}")
+    lines.append(f"🌐 {sender} | EN → VI + ZH")
+    lines.append("")
+    lines.append(f"🇺🇸 EN: {original}")
 
     if ipa_text:
-        parts.append(f"IPA: /{ipa_text}/")
+        lines.append(f"🔊 IPA: /{ipa_text}/")
 
     if vi:
-        parts.append(f"\nVI: {vi}")
+        lines.append(f"🇻🇳 VI: {vi}")
 
     if zh:
-        parts.append(f"\nZH: {zh}")
+        lines.append(f"🇨🇳 ZH: {zh}")
     if pinyin:
-        parts.append(f"Pinyin: {pinyin}")
+        lines.append(f"🈶 Pinyin: {pinyin}")
 
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
-# -------------------------
+def trim_telegram_message(text: str, max_len: int = 3500) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "\n\n...[message truncated]"
+
+
+# =========================
 # Telegram handler
-# -------------------------
+# =========================
 @bot.message_handler(content_types=["text"])
 def handle_message(message: types.Message):
     try:
@@ -318,11 +367,7 @@ def handle_message(message: types.Message):
             return
 
         text = (message.text or "").strip()
-        if not text:
-            return
-
-        # Bỏ qua command
-        if text.startswith("/"):
+        if not text or is_noise_message(text):
             return
 
         result = translate_text(text)
@@ -332,20 +377,21 @@ def handle_message(message: types.Message):
 
         sender = message.from_user.first_name or "User"
         reply_text = format_reply(sender, result)
+        reply_text = trim_telegram_message(reply_text)
 
-        max_telegram_len = 3500
-        if len(reply_text) > max_telegram_len:
-            reply_text = reply_text[:max_telegram_len] + "\n\n...[message truncated]"
-
-        bot.send_message(message.chat.id, reply_text)
+        bot.send_message(
+            chat_id=message.chat.id,
+            text=reply_text,
+            reply_to_message_id=message.message_id
+        )
 
     except Exception as e:
         print("Lỗi handle_message:", e)
 
 
-# -------------------------
+# =========================
 # Flask routes
-# -------------------------
+# =========================
 @app.route("/", methods=["GET"])
 def healthcheck():
     return "Bot is running", 200
