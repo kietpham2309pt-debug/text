@@ -1,3 +1,4 @@
+Flask
 pyTelegramBotAPI
 deep-translator
-flask
+pypinyin
