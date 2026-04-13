@@ -1,5 +1,8 @@
 import os
 import re
+import html
+from typing import Optional, List, Dict, Any
+
 from flask import Flask, request
 import telebot
 from telebot import types
@@ -34,13 +37,13 @@ def normalize_spaces(text: str) -> str:
     return text.strip()
 
 
-def split_text_for_translate(text: str, max_len: int = 1000) -> list[str]:
+def split_text_for_translate(text: str, max_len: int = 1000) -> List[str]:
     text = (text or "").strip()
     if not text:
         return []
 
     lines = text.splitlines()
-    chunks = []
+    chunks: List[str] = []
     current = ""
 
     for line in lines:
@@ -65,12 +68,12 @@ def split_text_for_translate(text: str, max_len: int = 1000) -> list[str]:
     return chunks
 
 
-def translate_in_chunks(text: str, target: str) -> str | None:
+def translate_in_chunks(text: str, target: str) -> Optional[str]:
     chunks = split_text_for_translate(text)
     if not chunks:
         return None
 
-    translated_parts = []
+    translated_parts: List[str] = []
     for chunk in chunks:
         translated = GoogleTranslator(source="auto", target=target).translate(chunk)
         if translated:
@@ -80,7 +83,7 @@ def translate_in_chunks(text: str, target: str) -> str | None:
     return result or None
 
 
-def safe_translate(text: str, target: str) -> str | None:
+def safe_translate(text: str, target: str) -> Optional[str]:
     try:
         return translate_in_chunks(text, target)
     except Exception as e:
@@ -104,11 +107,9 @@ def has_vietnamese_chars(text: str) -> bool:
 
 
 def strip_for_detect(text: str) -> str:
-    # Giữ chữ cái, số, khoảng trắng, CJK để detect ổn hơn
     text = re.sub(r"https?://\S+", " ", text)
     text = re.sub(r"[^\w\s\u4e00-\u9fffÀ-ỹ]", " ", text, flags=re.UNICODE)
-    text = normalize_spaces(text)
-    return text
+    return normalize_spaces(text)
 
 
 def detect_input_language(text: str) -> str:
@@ -127,7 +128,6 @@ def detect_input_language(text: str) -> str:
 
     cleaned = strip_for_detect(raw)
 
-    # Các câu quá ngắn rất dễ detect sai -> mặc định en
     letters_only = re.sub(r"[^A-Za-zÀ-ỹ\u4e00-\u9fff]", "", cleaned)
     if len(letters_only) <= 2:
         return "en"
@@ -147,9 +147,6 @@ def detect_input_language(text: str) -> str:
 
 
 def is_noise_message(text: str) -> bool:
-    """
-    Bỏ qua link, command, emoji rời rạc, hoặc text quá ít thông tin.
-    """
     text = (text or "").strip()
     if not text:
         return True
@@ -160,7 +157,6 @@ def is_noise_message(text: str) -> bool:
     if text.startswith("http://") or text.startswith("https://"):
         return True
 
-    # Chỉ emoji / ký hiệu / số
     has_letters = bool(re.search(r"[A-Za-zÀ-ỹ\u4e00-\u9fff]", text))
     if not has_letters:
         return True
@@ -171,7 +167,7 @@ def is_noise_message(text: str) -> bool:
 # =========================
 # IPA & Pinyin
 # =========================
-def text_to_ipa(text: str) -> str | None:
+def text_to_ipa(text: str) -> Optional[str]:
     if not text:
         return None
 
@@ -185,11 +181,7 @@ def text_to_ipa(text: str) -> str | None:
         return None
 
 
-def text_to_pinyin(text: str) -> str | None:
-    """
-    Chuyển chữ Hán sang pinyin có dấu.
-    Giữ số, chữ Latin, dấu câu cơ bản.
-    """
+def text_to_pinyin(text: str) -> Optional[str]:
     if not text:
         return None
 
@@ -200,7 +192,7 @@ def text_to_pinyin(text: str) -> str | None:
             flags=re.UNICODE
         )
 
-        out = []
+        out: List[str] = []
         for token in tokens:
             if re.fullmatch(r"[\u4e00-\u9fff]+", token):
                 py = " ".join(lazy_pinyin(token, style=Style.TONE, strict=False))
@@ -219,7 +211,7 @@ def text_to_pinyin(text: str) -> str | None:
 # =========================
 # Core translate logic
 # =========================
-def translate_text(text: str):
+def translate_text(text: str) -> Optional[Dict[str, Any]]:
     text = (text or "").strip()
     if not text:
         return None
@@ -236,12 +228,11 @@ def translate_text(text: str):
 
         return {
             "source_lang": "vi",
-            "original": text,
-            "vi": text,
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
             "zh": translated_zh,
             "pinyin": text_to_pinyin(translated_zh) if translated_zh else None,
+            "vi": None,
         }
 
     # ZH -> EN + VI
@@ -254,11 +245,10 @@ def translate_text(text: str):
 
         return {
             "source_lang": "zh",
-            "original": text,
-            "zh": text,
-            "pinyin": text_to_pinyin(text),
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
+            "zh": None,
+            "pinyin": text_to_pinyin(text),
             "vi": translated_vi,
         }
 
@@ -271,78 +261,74 @@ def translate_text(text: str):
 
     return {
         "source_lang": "en",
-        "original": text,
-        "en": text,
+        "en": None,
         "ipa": text_to_ipa(text),
-        "vi": translated_vi,
         "zh": translated_zh,
         "pinyin": text_to_pinyin(translated_zh) if translated_zh else None,
+        "vi": translated_vi,
     }
 
 
 # =========================
-# Output formatting
+# Output format
 # =========================
-def format_reply(sender: str, data: dict) -> str:
+def get_user_mention(user: types.User) -> str:
+    """
+    Ưu tiên @username.
+    Nếu không có username thì mention click được.
+    """
+    if getattr(user, "username", None):
+        return f"@{html.escape(user.username)}"
+
+    display_name = html.escape(user.first_name or "User")
+    return f'<a href="tg://user?id={user.id}">{display_name}</a>'
+
+
+def format_reply(message: types.Message, data: Dict[str, Any]) -> str:
+    mention = get_user_mention(message.from_user)
+
+    vi = html.escape(data.get("vi") or "")
+    en = html.escape(data.get("en") or "")
+    ipa_text = html.escape(data.get("ipa") or "")
+    zh = html.escape(data.get("zh") or "")
+    pinyin = html.escape(data.get("pinyin") or "")
     source_lang = data.get("source_lang")
-    original = data.get("original")
-    vi = data.get("vi")
-    en = data.get("en")
-    ipa_text = data.get("ipa")
-    zh = data.get("zh")
-    pinyin = data.get("pinyin")
 
-    lines = []
+    lines: List[str] = [mention]
 
+    # Người dùng gửi tiếng Việt -> hiện EN + IPA + ZH + pinyin
     if source_lang == "vi":
-        lines.append(f"🌐 {sender} | VI → EN + ZH")
-        lines.append("")
-        lines.append(f"🇻🇳 VI: {original}")
-
         if en:
-            lines.append(f"🇺🇸 EN: {en}")
+            lines.append(f"🇬🇧: {en}")
         if ipa_text:
-            lines.append(f"🔊 IPA: /{ipa_text}/")
-
+            lines.append(f"🔊: /{ipa_text}/")
         if zh:
-            lines.append(f"🇨🇳 ZH: {zh}")
+            lines.append(f"🇨🇳: {zh}")
         if pinyin:
-            lines.append(f"🈶 Pinyin: {pinyin}")
-
+            lines.append(f"abc: {pinyin}")
         return "\n".join(lines)
 
+    # Người dùng gửi tiếng Trung -> hiện pinyin + EN + IPA + VI
     if source_lang == "zh":
-        lines.append(f"🌐 {sender} | ZH → EN + VI")
-        lines.append("")
-        lines.append(f"🇨🇳 ZH: {original}")
-
         if pinyin:
-            lines.append(f"🈶 Pinyin: {pinyin}")
-
+            lines.append(f"abc: {pinyin}")
         if en:
-            lines.append(f"🇺🇸 EN: {en}")
+            lines.append(f"🇬🇧: {en}")
         if ipa_text:
-            lines.append(f"🔊 IPA: /{ipa_text}/")
-
+            lines.append(f"🔊: /{ipa_text}/")
         if vi:
-            lines.append(f"🇻🇳 VI: {vi}")
-
+            lines.append(f"🇻🇳: {vi}")
         return "\n".join(lines)
 
-    lines.append(f"🌐 {sender} | EN → VI + ZH")
-    lines.append("")
-    lines.append(f"🇺🇸 EN: {original}")
-
-    if ipa_text:
-        lines.append(f"🔊 IPA: /{ipa_text}/")
-
+    # Người dùng gửi tiếng Anh -> hiện VI + ZH + pinyin + IPA
     if vi:
-        lines.append(f"🇻🇳 VI: {vi}")
-
+        lines.append(f"🇻🇳: {vi}")
     if zh:
-        lines.append(f"🇨🇳 ZH: {zh}")
+        lines.append(f"🇨🇳: {zh}")
     if pinyin:
-        lines.append(f"🈶 Pinyin: {pinyin}")
+        lines.append(f"abc: {pinyin}")
+    if ipa_text:
+        lines.append(f"🔊: /{ipa_text}/")
 
     return "\n".join(lines)
 
@@ -375,14 +361,15 @@ def handle_message(message: types.Message):
             print("Không dịch được:", repr(text[:200]))
             return
 
-        sender = message.from_user.first_name or "User"
-        reply_text = format_reply(sender, result)
+        reply_text = format_reply(message, result)
         reply_text = trim_telegram_message(reply_text)
 
         bot.send_message(
             chat_id=message.chat.id,
             text=reply_text,
-            reply_to_message_id=message.message_id
+            reply_to_message_id=message.message_id,
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
 
     except Exception as e:
