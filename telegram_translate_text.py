@@ -111,9 +111,6 @@ def strip_for_detect(text: str) -> str:
 
 
 def detect_input_language(text: str) -> str:
-    """
-    Trả về: vi / en / zh
-    """
     raw = (text or "").strip()
     if not raw:
         return "en"
@@ -230,10 +227,6 @@ def ends_with_t_or_d(pron: str) -> bool:
 
 
 def apply_flap(pron: str, next_pron: str | None) -> str:
-    """
-    Kiểu Mỹ: t/d trước nguyên âm tiếp theo -> ɾ
-    Ví dụ: get it -> gɛɾ ɪt
-    """
     if not pron or not next_pron:
         return pron
 
@@ -257,13 +250,6 @@ def should_link(next_pron: str | None) -> bool:
 
 
 def text_to_ipa(text: str) -> str | None:
-    """
-    1 dòng IPA duy nhất:
-    - có stress marks
-    - có weak forms
-    - có flap t/d -> ɾ
-    - có ký hiệu nối âm ‿
-    """
     if not text:
         return None
 
@@ -306,10 +292,6 @@ def text_to_ipa(text: str) -> str | None:
 # Pinyin
 # =========================
 def text_to_pinyin(text: str) -> str | None:
-    """
-    Chuyển chữ Hán sang pinyin có dấu.
-    Giữ số, chữ Latin, dấu câu cơ bản.
-    """
     if not text:
         return None
 
@@ -346,7 +328,6 @@ def translate_text(text: str):
 
     source_lang = detect_input_language(text)
 
-    # VI -> EN + ZH
     if source_lang == "vi":
         translated_en = safe_translate(text, "en")
         translated_zh = safe_translate(text, "zh-CN")
@@ -356,15 +337,12 @@ def translate_text(text: str):
 
         return {
             "source_lang": "vi",
-            "original": text,
-            "vi": text,
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
             "zh": translated_zh,
             "pinyin": text_to_pinyin(translated_zh) if translated_zh else None,
         }
 
-    # ZH -> EN + VI
     if source_lang == "zh":
         translated_en = safe_translate(text, "en")
         translated_vi = safe_translate(text, "vi")
@@ -374,15 +352,12 @@ def translate_text(text: str):
 
         return {
             "source_lang": "zh",
-            "original": text,
-            "zh": text,
             "pinyin": text_to_pinyin(text),
             "en": translated_en,
             "ipa": text_to_ipa(translated_en) if translated_en else None,
             "vi": translated_vi,
         }
 
-    # EN -> VI + ZH
     translated_vi = safe_translate(text, "vi")
     translated_zh = safe_translate(text, "zh-CN")
 
@@ -391,8 +366,6 @@ def translate_text(text: str):
 
     return {
         "source_lang": "en",
-        "original": text,
-        "en": text,
         "ipa": text_to_ipa(text),
         "vi": translated_vi,
         "zh": translated_zh,
@@ -403,9 +376,8 @@ def translate_text(text: str):
 # =========================
 # Output formatting
 # =========================
-def format_reply(sender: str, data: dict) -> str:
+def format_reply(data: dict) -> str:
     source_lang = data.get("source_lang")
-    original = data.get("original")
     vi = data.get("vi")
     en = data.get("en")
     ipa_text = data.get("ipa")
@@ -415,54 +387,35 @@ def format_reply(sender: str, data: dict) -> str:
     lines = []
 
     if source_lang == "vi":
-        lines.append(f"🌐 {sender} | VI → EN + ZH")
-        lines.append("")
-        lines.append(f"🇻🇳 VI: {original}")
-
         if en:
-            lines.append(f"🇺🇸 EN: {en}")
+            lines.append(f"🇺🇸 {en}")
         if ipa_text:
-            lines.append(f"🔊 IPA: /{ipa_text}/")
-
+            lines.append(f"🔊 /{ipa_text}/")
         if zh:
-            lines.append(f"🇨🇳 ZH: {zh}")
+            lines.append(f"🇨🇳 {zh}")
         if pinyin:
-            lines.append(f"🈶 Pinyin: {pinyin}")
-
+            lines.append(f"🈶 {pinyin}")
         return "\n".join(lines)
 
     if source_lang == "zh":
-        lines.append(f"🌐 {sender} | ZH → EN + VI")
-        lines.append("")
-        lines.append(f"🇨🇳 ZH: {original}")
-
         if pinyin:
-            lines.append(f"🈶 Pinyin: {pinyin}")
-
+            lines.append(f"🈶 {pinyin}")
         if en:
-            lines.append(f"🇺🇸 EN: {en}")
+            lines.append(f"🇺🇸 {en}")
         if ipa_text:
-            lines.append(f"🔊 IPA: /{ipa_text}/")
-
+            lines.append(f"🔊 /{ipa_text}/")
         if vi:
-            lines.append(f"🇻🇳 VI: {vi}")
-
+            lines.append(f"🇻🇳 {vi}")
         return "\n".join(lines)
 
-    lines.append(f"🌐 {sender} | EN → VI + ZH")
-    lines.append("")
-    lines.append(f"🇺🇸 EN: {original}")
-
     if ipa_text:
-        lines.append(f"🔊 IPA: /{ipa_text}/")
-
+        lines.append(f"🔊 /{ipa_text}/")
     if vi:
-        lines.append(f"🇻🇳 VI: {vi}")
-
+        lines.append(f"🇻🇳 {vi}")
     if zh:
-        lines.append(f"🇨🇳 ZH: {zh}")
+        lines.append(f"🇨🇳 {zh}")
     if pinyin:
-        lines.append(f"🈶 Pinyin: {pinyin}")
+        lines.append(f"🈶 {pinyin}")
 
     return "\n".join(lines)
 
@@ -495,8 +448,7 @@ def handle_message(message: types.Message):
             print("Không dịch được:", repr(text[:200]))
             return
 
-        sender = message.from_user.first_name or "User"
-        reply_text = format_reply(sender, result)
+        reply_text = format_reply(result)
         reply_text = trim_telegram_message(reply_text)
 
         bot.send_message(
