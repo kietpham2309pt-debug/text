@@ -1,10 +1,12 @@
 import os
 import re
+import threading
 from flask import Flask, request
 import telebot
 from telebot import types
-from deep_translator import GoogleTranslator
 from langdetect import detect, DetectorFactory
+
+from translate_engine import looks_like_error_page, translate_chunk
 import eng_to_ipa as ipa
 from pypinyin import lazy_pinyin, Style
 
@@ -72,7 +74,9 @@ def translate_in_chunks(text: str, target: str) -> str | None:
 
     translated_parts = []
     for chunk in chunks:
-        translated = GoogleTranslator(source="auto", target=target).translate(chunk)
+        # translate_chunk ném TranslationError khi mọi nguồn hỏng, nên lỗi
+        # không bao giờ bị biến thành "bản dịch". safe_translate bắt ở ngoài.
+        translated = translate_chunk(chunk, target)
         if translated:
             translated_parts.append(translated)
 
@@ -449,6 +453,12 @@ def handle_message(message: types.Message):
             return
 
         reply_text = format_reply(result)
+
+        # Chốt chặn cuối: thà im lặng còn hơn đăng trang lỗi lên group.
+        if not reply_text.strip() or looks_like_error_page(reply_text):
+            print("Bỏ qua vì kết quả không hợp lệ:", repr(reply_text[:200]))
+            return
+
         reply_text = trim_telegram_message(reply_text)
 
         bot.send_message(
@@ -469,18 +479,30 @@ def healthcheck():
     return "Bot is running", 200
 
 
+def _process_update_safely(update):
+    try:
+        bot.process_new_updates([update])
+    except Exception as e:
+        print("Lỗi xử lý update:", e)
+
+
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
-    try:
-        if request.headers.get("content-type") == "application/json":
-            json_str = request.get_data().decode("utf-8")
-            update = types.Update.de_json(json_str)
-            bot.process_new_updates([update])
-            return "", 200
+    content_type = (request.headers.get("content-type") or "").lower()
+    if not content_type.startswith("application/json"):
         return "Unsupported Media Type", 415
+
+    try:
+        json_str = request.get_data().decode("utf-8")
+        update = types.Update.de_json(json_str)
     except Exception as e:
-        print("Lỗi webhook:", e)
-        return "Internal Server Error", 500
+        print("Lỗi đọc update:", e)
+        return "", 200  # bỏ qua update hỏng, tránh Telegram gửi lại mãi
+
+    # Dịch có thể mất vài giây (retry nhiều nguồn). Trả 200 ngay để Telegram
+    # không timeout rồi gửi lại update -> tránh bot trả lời trùng.
+    threading.Thread(target=_process_update_safely, args=(update,), daemon=True).start()
+    return "", 200
 
 
 if __name__ == "__main__":
@@ -491,4 +513,4 @@ if __name__ == "__main__":
     bot.set_webhook(url=WEBHOOK_URL)
 
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
